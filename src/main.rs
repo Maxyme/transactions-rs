@@ -1,10 +1,15 @@
-use std::collections::HashMap;
 /// Transaction-rs.
-use std::path::PathBuf;
-use csv::{ReaderBuilder, Trim};
 use anyhow::Result;
-// Using the prelude can help importing trait based functions (e.g. core::str::FromStr).
+use csv::{ReaderBuilder, Trim, Writer};
+use std::collections::HashMap;
+use std::{env, io};
+
+use log::warn;
 use rust_decimal::prelude::*;
+use serde::Serialize;
+use std::path::PathBuf;
+
+const DECIMALS: u32 = 4;
 
 #[derive(Deserialize, Debug)]
 enum TxType {
@@ -20,15 +25,13 @@ enum TxType {
     Chargeback,
 }
 
-use serde::Serialize;
-#[derive(Deserialize, Debug)]
+#[derive(Serialize, Debug)]
 struct Output {
     client: u16,
     available: Decimal,
     held: Decimal,
-    // todo: output to 4 decimals no matter what
     total: Decimal,
-    locked: bool
+    locked: bool,
 }
 
 use serde::Deserialize;
@@ -51,9 +54,8 @@ impl Default for Account {
     fn default() -> Account {
         Account {
             locked: false,
-            available: Decimal::from(0),
-            held: Decimal::from(0)
-            //..Default::default()
+            available: Decimal::new(0, DECIMALS),
+            held: Decimal::new(0, DECIMALS),
         }
     }
 }
@@ -64,44 +66,41 @@ impl Account {
     }
 }
 
+#[derive(Debug)]
 struct Transaction {
     amount: Decimal,
-    under_dispute: bool
+    under_dispute: bool,
 }
-
-// Todo add new instead with amount specified
-impl Default for Transaction {
-    fn default() -> Transaction {
-        Transaction {
-            under_dispute: false,
-            amount: Decimal::from(0),
-        }
-    }
-}
-
 
 fn main() -> Result<()> {
-    //println!("Hello, world!");
-    // todo pass path as arg
-    let path = PathBuf::from("example.csv");
+    // Parse input args. Note this can be more robust with a package like `clap`
+    let args: Vec<String> = env::args().collect();
+    let path = PathBuf::from(&args[1]);
 
-    // Create a reader that will trim whitespaces
+    // Create a reader that trims whitespaces
     let mut reader = ReaderBuilder::new().trim(Trim::All).from_path(path)?;
 
+    // Store client accounts and transactions in separate hashmaps
     let mut client_accounts: HashMap<u16, Account> = HashMap::new();
     let mut transactions: HashMap<u32, Transaction> = HashMap::new();
-    // todo: fill hashmap
-    // todo: confirm stream read
+
     for record in reader.deserialize() {
+        // Note, we assume 4 decimals here, so we don't raise nor rescale.
+        // but it should be done if we don't fully trust the input
         let record: Input = record?;
-        println!("{:?}", record);
-        // Save a copy of the transaction
-        let mut new_tx = Transaction::default();
-        new_tx.
+
+        // Save a copy of the transaction for disputes
+        //let amout = record.amount.rescale()
+        let new_tx = Transaction {
+            amount: record.amount,
+            under_dispute: false,
+        };
         transactions.insert(record.tx, new_tx);
 
         // create entry if not found
-        let client_account = client_accounts.entry(record.client).or_insert_with(|| Account::default());
+        let client_account = client_accounts
+            .entry(record.client)
+            .or_insert_with(Account::default);
         match record.r#type {
             TxType::Deposit => {
                 client_account.available += record.amount;
@@ -110,38 +109,59 @@ fn main() -> Result<()> {
                 // Only withdraw if amount in account
                 if client_account.available >= record.amount {
                     client_account.available -= record.amount;
+                } else {
+                    // log invalid withdrawal
+                    warn!("Unable to withdraw amount: {} from account {}", record.amount, record.client);
                 }
             }
             TxType::Dispute => {
-                // Note it's possible that the tx doesn't exist, in that case ignore
-                match transactions.get(&record.tx) {
-                    Some(amount) => {
-                        // todo: make sure that the transaction was a deposit, otherwise it would allow system abuse
-
-                        client_account.available -= amount;
-                        client_account.held += amount;
-                        // todo: Set transaction in dispute to true
-                    },
-                    None => ()
+                if let Some(tx) = transactions.get_mut(&record.tx) {
+                    // todo: should we make sure that the transaction was a deposit, otherwise it would allow system abuse
+                    client_account.available -= tx.amount;
+                    client_account.held += tx.amount;
+                    tx.under_dispute = true;
+                } else {
+                    // Note it's possible that the tx doesn't exist, in that case ignore and log
                 }
-
-
             }
             TxType::Resolve => {
-                // todo: check that the transaction was actually under dispute
-                match transactions.get(&record.tx) {
-                    Some(tx) => {
-                        client_account.available += amount;
-                        client_account.held -= amount;
-                    },
-                    None => ()
+                if let Some(tx) = transactions.get_mut(&record.tx) {
+                    // todo: should we make sure that the transaction was a deposit, otherwise it would allow system abuse
+                    client_account.available += tx.amount;
+                    client_account.held -= tx.amount;
+                    tx.under_dispute = false;
+                } else {
+                    // Note it's possible that the tx doesn't exist, in that case ignore and log
                 }
             }
-            TxType::Chargeback => {}
+            TxType::Chargeback => {
+                if let Some(tx) = transactions.get(&record.tx) {
+                    if tx.under_dispute {
+                        if client_account.held >= tx.amount {
+                            client_account.held -= tx.amount;
+                        } else {
+                            // log invalid chargeback
+                        }
+                    } else {
+                        // log invalid resolve status
+                    }
+                }
+            }
         }
     }
-    println!("{:?}", transactions);
-    println!("{:?}", client_accounts);
-    // Output the client account balances
+
+    // Output the client account balances to stdout
+    let mut wtr = Writer::from_writer(io::stdout());
+    for (client_id, account) in client_accounts {
+        // Output values with four places past the decimal
+        wtr.serialize(Output {
+            client: client_id,
+            available: account.available,
+            held: account.held,
+            total: account.total(),
+            locked: account.locked,
+        })?;
+    }
+    wtr.flush()?;
     Ok(())
 }
