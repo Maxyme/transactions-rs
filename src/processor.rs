@@ -29,6 +29,8 @@ impl Account {
 
 #[derive(Debug)]
 pub struct Transaction {
+    pub client: u16,
+    pub tx_type: TxType,
     pub amount: Decimal,
     pub under_dispute: bool,
 }
@@ -58,6 +60,8 @@ pub fn process_record(
         // but it should be done if we don't fully trust the input
         // record.amount.rescale(4)
         let new_tx = Transaction {
+            client: record.client,
+            tx_type: record.r#type.clone(),
             amount,
             under_dispute: false,
         };
@@ -66,6 +70,8 @@ pub fn process_record(
 
     match record.r#type {
         TxType::Deposit => {
+            // Note unwrap is safe here because of the type matching
+            // however to be more thorough, a check on the option should be done (same for withdrawal)
             client_account.available += record.amount.unwrap();
         }
         TxType::Withdrawal => {
@@ -83,10 +89,15 @@ pub fn process_record(
         }
         TxType::Dispute => {
             if let Some(tx) = transactions.get_mut(&record.tx) {
-                // todo: should we make sure that the transaction was a deposit, otherwise it would allow system abuse
-                client_account.available -= tx.amount;
-                client_account.held += tx.amount;
-                tx.under_dispute = true;
+                // Note make sure that there are enough funds to dispute a transaction was a deposit,
+                // and make sure that the transaction was a deposit otherwise it would allow system abuse
+                if tx.tx_type == TxType::Deposit && client_account.available >= tx.amount {
+                    client_account.available -= tx.amount;
+                    client_account.held += tx.amount;
+                    tx.under_dispute = true;
+                } else {
+                    warn!("Not enough found or previous transaction was not a deposit for transaction {}", record.tx);
+                }
             } else {
                 // Note it's possible that the tx doesn't exist, in that case ignore and log
                 warn!("Unable to find transaction for dispute {}", record.tx);
@@ -94,10 +105,17 @@ pub fn process_record(
         }
         TxType::Resolve => {
             if let Some(tx) = transactions.get_mut(&record.tx) {
-                // todo: should we make sure that the transaction was a deposit, otherwise it would allow system abuse
-                client_account.available += tx.amount;
-                client_account.held -= tx.amount;
-                tx.under_dispute = false;
+                // Note: only resolve transactions that were under dispute
+                if tx.under_dispute {
+                    client_account.available += tx.amount;
+                    client_account.held -= tx.amount;
+                    tx.under_dispute = false;
+                } else {
+                    warn!(
+                        "Transaction {} was not under dispute, cannot resolve.",
+                        record.tx
+                    );
+                }
             } else {
                 // Note it's possible that the tx doesn't exist, in that case ignore and log
                 warn!("Unable to find transaction to resolve {}", record.tx);
@@ -151,7 +169,7 @@ mod tests {
             r#type: TxType::Deposit,
             client: 1,
             tx: 10,
-            amount: dec!(10.0004),
+            amount: Some(dec!(10.0004)),
         };
         process_record(&mut client_accounts, &mut transactions, input);
         // Check that the client account is correct
@@ -176,7 +194,7 @@ mod tests {
             r#type: TxType::Deposit,
             client: 1,
             tx: 10,
-            amount: dec!(10.0004),
+            amount: Some(dec!(10.0004)),
         };
         process_record(&mut client_accounts, &mut transactions, input);
         // Check that the available funds did not change
@@ -200,7 +218,7 @@ mod tests {
             r#type: TxType::Withdrawal,
             client: 1,
             tx: 10,
-            amount: dec!(10.0004),
+            amount: Some(dec!(10.0004)),
         };
         process_record(&mut client_accounts, &mut transactions, input);
         // Check that the client account is correct
@@ -214,21 +232,41 @@ mod tests {
         let mut client_accounts: HashMap<u16, Account> = HashMap::new();
         let account = Account {
             locked: false,
-            available: dec!(10.2),
+            available: dec!(0),
             held: dec!(0),
         };
         client_accounts.insert(1, account);
         let mut transactions: HashMap<u32, Transaction> = HashMap::new();
-        //let tx = Transaction { amount: , under_dispute: false };
-        let input = Input {
+
+        // Add a deposit
+        let deposit = Input {
+            r#type: TxType::Deposit,
+            client: 1,
+            tx: 1,
+            amount: Some(dec!(10)),
+        };
+        process_record(&mut client_accounts, &mut transactions, deposit);
+
+        // Add a dispute
+        let dispute = Input {
             r#type: TxType::Dispute,
             client: 1,
-            tx: 10,
-            amount: dec!(10.0004),
+            tx: 1,
+            amount: None,
         };
-        process_record(&mut client_accounts, &mut transactions, input);
-        // Check that the client account is locked
+        process_record(&mut client_accounts, &mut transactions, dispute);
+
+        // Add a chargeback
+        let chargeback = Input {
+            r#type: TxType::Chargeback,
+            client: 1,
+            tx: 1,
+            amount: None,
+        };
+        process_record(&mut client_accounts, &mut transactions, chargeback);
+
+        // Check that the client account is now locked
         let updated_account = client_accounts.get(&1).unwrap();
-        assert_eq!(updated_account.locked, dec!(0.1996));
+        assert_eq!(updated_account.locked, true);
     }
 }

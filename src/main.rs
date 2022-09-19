@@ -17,7 +17,7 @@ mod processor;
 
 const DECIMALS: u32 = 4;
 
-#[derive(Deserialize, Debug)]
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
 pub enum TxType {
     #[serde(rename = "deposit")]
     Deposit,
